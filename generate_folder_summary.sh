@@ -23,6 +23,7 @@ declare -a include_patterns=()
 declare -a exclude_patterns=()
 use_include_filter=false
 use_exclude_filter=false
+include_summary=false
 
 # Color codes for better CLI output (disabled if not interactive)
 if [[ -t 1 ]]; then
@@ -62,6 +63,7 @@ Options:
     -i, --include PATTERNS              Comma-separated list of patterns to include
     -e, --exclude PATTERNS              Comma-separated list of patterns to exclude
     -o, --output MODE                   Output mode: 'cli' (default) or 'file'
+    -is, --include-summary              Include summary of file contents (default: false)
     -v, --version                       Show version information
 
 Examples:
@@ -250,24 +252,30 @@ process_file() {
     fi
     
     # Check file size (warn for large files)
-    local file_size
-    file_size=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo 0)
+    local file_size=0
+    if command -v stat >/dev/null 2>&1; then
+        # Try to get file size (macOS first, then Linux)
+        file_size=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo 0)
+    fi
+    
     if (( file_size > 10485760 )); then  # 10MB
         info "Warning: Large file ($(( file_size / 1048576 ))MB): $relative_path"
     fi
     
-    # Output file header and content
+    # Output file header
     output_content "# $relative_path"
     
-    # Use cat with error handling
-    if cat "$file" 2>/dev/null; then
-        output_content ""
-        output_content ""
+    # Output file content
+    local file_content
+    if file_content=$(cat "$file" 2>/dev/null); then
+        output_content "$file_content"
     else
         output_content "[Error reading file content]"
-        output_content ""
-        output_content ""
-    fi | output_content "$(cat)"
+    fi
+    
+    # Add blank lines after content
+    output_content ""
+    output_content ""
     
     # Print progress message only for file output
     if [[ "$output_mode" == "file" ]]; then
@@ -318,6 +326,10 @@ parse_arguments() {
                 fi
                 output_mode="$2"
                 shift 2
+                ;;
+            -is|--include-summary)
+                include_summary=true
+                shift
                 ;;
             -*)
                 error "Unknown option: $1"
@@ -377,28 +389,29 @@ main() {
     # Always exclude the summary file
     find_cmd+=(\! -name "$SUMMARY_FILENAME")
     
-    # Add .git exclusion for efficiency
-    find_cmd+=(\! -path "*/\.*")
+    # Exclude hidden files and files inside hidden directories
+    find_cmd+=(\! -path '*/.*/*')
+    find_cmd+=(\! -path '*/.*')
     
     # Process files
     local file_count=0
     local processed_count=0
     
     while IFS= read -r -d '' file; do
-        ((file_count++))
+        ((file_count++)) || true  # Prevent exit on arithmetic operations
         
         # Calculate relative path
         relative_path="${file#"$folder_path/"}"
         
         # Apply exclude filter
-        if [[ "$use_exclude_filter" == true ]]; then
+        if [[ "$use_exclude_filter" == true ]] && [[ ${#exclude_patterns[@]} -gt 0 ]]; then
             if matches_pattern "$relative_path" "${exclude_patterns[@]}"; then
                 continue
             fi
         fi
         
         # Apply include filter
-        if [[ "$use_include_filter" == true ]]; then
+        if [[ "$use_include_filter" == true ]] && [[ ${#include_patterns[@]} -gt 0 ]]; then
             if ! matches_pattern "$relative_path" "${include_patterns[@]}"; then
                 continue
             fi
@@ -406,16 +419,18 @@ main() {
         
         # Process the file
         process_file "$file" "$relative_path"
-        ((processed_count++))
+        ((processed_count++)) || true  # Prevent exit on arithmetic operations
         
     done < <("${find_cmd[@]}" -print0 2>/dev/null)
     
     # Summary statistics
-    if [[ "$output_mode" == "file" ]]; then
-        success "Summary complete: $processed_count/$file_count files processed"
-        success "Output saved to: $output_file"
-    else
-        info "Processed $processed_count/$file_count files"
+    if $include_summary; then
+        if [[ "$output_mode" == "file" ]]; then
+            success "Summary complete: $processed_count/$file_count files processed"
+            success "Output saved to: $output_file"
+        else
+            info "Processed $processed_count/$file_count files"
+        fi
     fi
 }
 
