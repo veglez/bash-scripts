@@ -10,7 +10,7 @@ set -euo pipefail
 
 # Script metadata
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 
 # Default configuration
 readonly DEFAULT_OUTPUT_MODE="cli"
@@ -25,6 +25,14 @@ declare -a exclude_patterns=()
 use_include_filter=false
 use_exclude_filter=false
 exclude_hidden="${DEFAULT_EXCLUDE_HIDDEN}"
+include_summary=false
+
+# Statistics for summary
+declare -A file_extensions
+declare -A file_sizes
+total_size=0
+largest_file=""
+largest_file_size=0
 
 # Color codes for better CLI output (disabled if not interactive)
 if [[ -t 1 ]]; then
@@ -65,6 +73,7 @@ Options:
     -e, --exclude PATTERNS              Comma-separated list of patterns to exclude
     -o, --output MODE                   Output mode: 'cli' (default) or 'file'
     -H, --include-hidden                Include hidden files and directories
+    -s, --include-summary               Include a summary at the end
     -v, --version                       Show version information
 
 Examples:
@@ -72,6 +81,7 @@ Examples:
     ${SCRIPT_NAME} /path/to/folder --include '*.py,*.sh' --output file
     ${SCRIPT_NAME} /path/to/folder --exclude 'node_modules,*.log'
     ${SCRIPT_NAME} /path/to/folder --include-hidden --exclude '.git/*'
+    ${SCRIPT_NAME} /path/to/folder --include-summary
 
 EOF
 }
@@ -122,6 +132,11 @@ OPTIONS:
         By default, hidden files are excluded unless explicitly matched by
         an include pattern.
 
+    -s, --include-summary
+        Optional. Generate and display a summary at the end with statistics
+        about processed files, including file counts by extension, total size,
+        and largest files.
+
     -v, --version
         Display version information.
 
@@ -144,11 +159,14 @@ EXAMPLES:
     Exclude .git but include other hidden files:
         ${SCRIPT_NAME} /home/user/project --include-hidden --exclude '.git/*'
 
+    Generate with summary statistics:
+        ${SCRIPT_NAME} /home/user/project --include-summary
+
     Exclude test files and logs:
         ${SCRIPT_NAME} /home/user/project --exclude '*test*,*.log'
 
-    Save output to file:
-        ${SCRIPT_NAME} /home/user/project --output file
+    Save output to file with summary:
+        ${SCRIPT_NAME} /home/user/project --output file --include-summary
 
     Complex pattern example:
         ${SCRIPT_NAME} /project --include 'src/*.js,lib/*.py' --exclude '*/test/*'
@@ -158,6 +176,7 @@ NOTES:
     - Hidden files and directories (starting with .) are excluded by default
     - Use --include-hidden to process all hidden files
     - Use --include with specific patterns to include only certain hidden files
+    - Use --include-summary to add statistics at the end of the output
     - Patterns are matched against the relative path from the target folder
     - Use quotes around patterns to prevent shell expansion
     - File content is read using UTF-8 encoding
@@ -287,6 +306,27 @@ process_file() {
         info "Warning: Large file ($(( file_size / 1048576 ))MB): $relative_path"
     fi
     
+    # Collect statistics if summary is requested
+    if [[ "$include_summary" == true ]]; then
+        # Get file extension
+        local extension="${relative_path##*.}"
+        if [[ "$extension" == "$relative_path" ]]; then
+            extension="no_extension"
+        else
+            extension=".$extension"
+        fi
+        
+        # Update statistics
+        ((file_extensions["$extension"]++)) || file_extensions["$extension"]=1
+        ((total_size += file_size))
+        
+        # Track largest file
+        if (( file_size > largest_file_size )); then
+            largest_file="$relative_path"
+            largest_file_size=$file_size
+        fi
+    fi
+    
     # Output file header
     output_content "# $relative_path"
     
@@ -308,6 +348,80 @@ process_file() {
     fi
 }
 
+# Function to generate and display summary
+generate_summary() {
+    local separator="================================================================================"
+    
+    output_content ""
+    output_content "$separator"
+    output_content "# SUMMARY STATISTICS"
+    output_content "$separator"
+    output_content ""
+    
+    # Files processed
+    output_content "## Files Processed"
+    output_content "- Total files analyzed: $processed_count"
+    output_content "- Total files found: $file_count"
+    if (( file_count > processed_count )); then
+        output_content "- Files filtered out: $(( file_count - processed_count ))"
+    fi
+    output_content ""
+    
+    # Total size
+    output_content "## Size Information"
+    if (( total_size < 1024 )); then
+        output_content "- Total size: ${total_size} bytes"
+    elif (( total_size < 1048576 )); then
+        output_content "- Total size: $(awk "BEGIN {printf \"%.2f\", $total_size/1024}") KB"
+    elif (( total_size < 1073741824 )); then
+        output_content "- Total size: $(awk "BEGIN {printf \"%.2f\", $total_size/1048576}") MB"
+    else
+        output_content "- Total size: $(awk "BEGIN {printf \"%.2f\", $total_size/1073741824}") GB"
+    fi
+    
+    if [[ -n "$largest_file" ]]; then
+        output_content "- Largest file: $largest_file ($(awk "BEGIN {printf \"%.2f\", $largest_file_size/1048576}") MB)"
+    fi
+    output_content ""
+    
+    # File types breakdown
+    if [[ ${#file_extensions[@]} -gt 0 ]]; then
+        output_content "## File Types Breakdown"
+        # Sort extensions by count
+        for ext in $(printf '%s\n' "${!file_extensions[@]}" | sort); do
+            local count="${file_extensions[$ext]}"
+            local percentage=$(awk "BEGIN {printf \"%.1f\", ($count/$processed_count)*100}")
+            output_content "- $ext: $count files (${percentage}%)"
+        done
+        output_content ""
+    fi
+    
+    # Applied filters
+    output_content "## Applied Filters"
+    if [[ "$use_include_filter" == true ]]; then
+        output_content "- Include patterns: ${include_patterns[*]}"
+    fi
+    if [[ "$use_exclude_filter" == true ]]; then
+        output_content "- Exclude patterns: ${exclude_patterns[*]}"
+    fi
+    if [[ "$exclude_hidden" == false ]]; then
+        output_content "- Hidden files: included"
+    else
+        output_content "- Hidden files: excluded (default)"
+    fi
+    output_content ""
+    
+    # Timestamp
+    output_content "## Generation Info"
+    output_content "- Generated on: $(date '+%Y-%m-%d %H:%M:%S')"
+    output_content "- Source directory: $folder_path"
+    if [[ "$output_mode" == "file" ]]; then
+        output_content "- Output file: $output_file"
+    fi
+    output_content ""
+    output_content "$separator"
+}
+
 # Parse command line arguments
 parse_arguments() {
     local args=()
@@ -320,6 +434,10 @@ parse_arguments() {
                 ;;
             -H|--include-hidden)
                 exclude_hidden=false
+                shift
+                ;;
+            -s|--include-summary)
+                include_summary=true
                 shift
                 ;;
             -v|--version)
@@ -417,6 +535,7 @@ main() {
     # Process files
     local file_count=0
     local processed_count=0
+    local relative_path
     
     while IFS= read -r -d '' file; do
         ((file_count++)) || true  # Prevent exit on arithmetic operations
@@ -424,7 +543,9 @@ main() {
         # Calculate relative path
         relative_path="${file#"$folder_path/"}"
         
+        # Check if we should exclude hidden files by default
         if [[ "$exclude_hidden" == true ]] && [[ "$relative_path" =~ (^|/)\. ]]; then
+            # Skip hidden files unless explicitly included
             if [[ "$use_include_filter" == true ]] && [[ ${#include_patterns[@]} -gt 0 ]]; then
                 if ! matches_pattern "$relative_path" "${include_patterns[@]}"; then
                     continue
@@ -455,12 +576,19 @@ main() {
         
     done < <("${find_cmd[@]}" -print0 2>/dev/null)
     
+    # Generate summary if requested
+    if [[ "$include_summary" == true ]] && (( processed_count > 0 )); then
+        generate_summary
+    fi
+    
     # Summary statistics
     if [[ "$output_mode" == "file" ]]; then
         success "Summary complete: $processed_count/$file_count files processed"
         success "Output saved to: $output_file"
     else
-        info "Processed $processed_count/$file_count files"
+        if [[ "$include_summary" == false ]]; then
+            info "Processed $processed_count/$file_count files"
+        fi
     fi
 }
 
