@@ -10,7 +10,7 @@ set -euo pipefail
 
 # Script metadata
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 
 # Default configuration
 readonly DEFAULT_OUTPUT_MODE="cli"
@@ -79,9 +79,10 @@ Options:
 Examples:
     ${SCRIPT_NAME} /path/to/folder
     ${SCRIPT_NAME} /path/to/folder --include '*.py,*.sh' --output file
-    ${SCRIPT_NAME} /path/to/folder --exclude 'node_modules,*.log'
+    ${SCRIPT_NAME} /path/to/folder --exclude 'node_modules/*,*.log'
     ${SCRIPT_NAME} /path/to/folder --include-hidden --exclude '.git/*'
     ${SCRIPT_NAME} /path/to/folder --include-summary
+    ${SCRIPT_NAME} /path/to/folder --include 'package.json,turbo.json'
 
 EOF
 }
@@ -108,6 +109,11 @@ PATTERN MATCHING:
     - Use --include-hidden to include ALL hidden files
     - Use --include '.pattern' to include specific hidden files
     - Exclude patterns work on hidden files when --include-hidden is used
+    
+    Performance optimization:
+    - Directory exclusion patterns (ending with /* or /*/) skip entire directories
+    - Examples: '.git/*', 'node_modules/*', 'build/*'
+    - These patterns prevent traversing into matching directories entirely
 
 OPTIONS:
     <folder_path>
@@ -164,12 +170,18 @@ EXAMPLES:
 
     Exclude test files and logs:
         ${SCRIPT_NAME} /home/user/project --exclude '*test*,*.log'
+        
+    Performance optimized exclusion (skips entire directories):
+        ${SCRIPT_NAME} /home/user/project --exclude '.git/*,node_modules/*,__pycache__/*'
 
     Save output to file with summary:
         ${SCRIPT_NAME} /home/user/project --output file --include-summary
 
     Complex pattern example:
         ${SCRIPT_NAME} /project --include 'src/*.js,lib/*.py' --exclude '*/test/*'
+        
+    Debug mode to see find command:
+        DEBUG=true ${SCRIPT_NAME} /project --exclude '.git/*,node_modules/*'
 
 NOTES:
     - The script automatically excludes '${SUMMARY_FILENAME}' from processing
@@ -180,6 +192,14 @@ NOTES:
     - Patterns are matched against the relative path from the target folder
     - Use quotes around patterns to prevent shell expansion
     - File content is read using UTF-8 encoding
+    - Set DEBUG=true to see the generated find command
+    
+PERFORMANCE:
+    - Directory patterns in --exclude (e.g., '.git/*', 'node_modules/*') will
+      prevent the script from entering those directories entirely, significantly
+      improving performance on large directory trees
+    - Simple filename patterns in --include (e.g., '*.py', '*.sh') are processed
+      directly by 'find' for better performance
 
 EOF
 }
@@ -317,6 +337,7 @@ process_file() {
         fi
         
         # Update statistics
+        : "${file_extensions[$extension]:=0}"
         ((file_extensions["$extension"]++)) || file_extensions["$extension"]=1
         ((total_size += file_size))
         
@@ -527,15 +548,91 @@ main() {
     fi
     
     # Build find command with proper exclusions
-    local find_cmd=(find "$folder_path" -type f)
+    local find_cmd=(find "$folder_path")
+    
+    # Add directory pruning for exclude patterns
+    if [[ "$use_exclude_filter" == true ]] && [[ ${#exclude_patterns[@]} -gt 0 ]]; then
+        for pattern in "${exclude_patterns[@]}"; do
+            # Check if pattern indicates a directory to skip
+            # Patterns like: dirname/*, */dirname/*, or /full/path/*
+            if [[ "$pattern" =~ ^([^/]+)/\*?$ ]] || [[ "$pattern" =~ ^\*/([^/]+)/\*?$ ]]; then
+                # Extract directory name (e.g., ".git" from ".git/*" or "node_modules" from "*/node_modules/*")
+                local dir_name="${BASH_REMATCH[1]:-${BASH_REMATCH[2]}}"
+                # Add prune for this directory - find won't descend into it
+                find_cmd+=(\( -type d -name "$dir_name" -prune \) -o)
+            elif [[ "$pattern" =~ ^([^*]+)/\*?$ ]]; then
+                # Full path directory pattern (e.g., "src/vendor/*")
+                local dir_path="${BASH_REMATCH[1]}"
+                find_cmd+=(\( -type d -path "*/$dir_path" -prune \) -o)
+            fi
+        done
+    fi
+    
+    # Add default hidden directory pruning if not including hidden files
+    if [[ "$exclude_hidden" == true ]]; then
+        find_cmd+=(\( -type d -name ".*" -prune \) -o)
+    fi
+    
+    # Now add file type and basic exclusions
+    find_cmd+=(-type f)
     
     # Always exclude the summary file
     find_cmd+=(\! -name "$SUMMARY_FILENAME")
+    
+    # Add simple filename patterns from include filter to find command
+    local complex_include_patterns=()
+    if [[ "$use_include_filter" == true ]] && [[ ${#include_patterns[@]} -gt 0 ]]; then
+        local has_simple_pattern=false
+        find_cmd+=(\()
+        
+        for pattern in "${include_patterns[@]}"; do
+            # Check if it's a simple filename pattern (e.g., *.py, *.sh)
+            if [[ "$pattern" =~ ^\*\.([^/]+)$ ]] || [[ "$pattern" =~ ^([^/*]+)$ ]]; then
+                if [[ "$has_simple_pattern" == true ]]; then
+                    find_cmd+=(-o)
+                fi
+                if [[ "$pattern" =~ ^\*\.([^/]+)$ ]]; then
+                    find_cmd+=(-name "$pattern")
+                else
+                    find_cmd+=(-name "$pattern")
+                fi
+                has_simple_pattern=true
+            else
+                # Complex pattern - will be handled in the loop
+                complex_include_patterns+=("$pattern")
+            fi
+        done
+        
+        find_cmd+=(\))
+        
+        # If all patterns are complex, remove the empty parentheses
+        if [[ "$has_simple_pattern" == false ]]; then
+            unset 'find_cmd[-1]'  # Remove closing parenthesis
+            unset 'find_cmd[-1]'  # Remove opening parenthesis
+        fi
+    fi
+    
+    # Add print0 at the end
+    find_cmd+=(-print0)
+    
+    # Debug output if verbose/debug mode is enabled
+    if [[ "${DEBUG:-}" == "true" ]]; then
+        info "Find command: ${find_cmd[*]}"
+    fi
     
     # Process files
     local file_count=0
     local processed_count=0
     local relative_path
+    
+    # Update include patterns if we have complex patterns
+    if [[ ${#complex_include_patterns[@]} -gt 0 ]]; then
+        use_include_filter=true
+        include_patterns=("${complex_include_patterns[@]}")
+    elif [[ "$use_include_filter" == true ]] && [[ "$has_simple_pattern" == true ]]; then
+        # Simple patterns are handled by find, so disable include filter in loop
+        use_include_filter=false
+    fi
     
     while IFS= read -r -d '' file; do
         ((file_count++)) || true  # Prevent exit on arithmetic operations
@@ -544,6 +641,7 @@ main() {
         relative_path="${file#"$folder_path/"}"
         
         # Check if we should exclude hidden files by default
+        # (This is now mostly handled by find -prune, but we still check for edge cases)
         if [[ "$exclude_hidden" == true ]] && [[ "$relative_path" =~ (^|/)\. ]]; then
             # Skip hidden files unless explicitly included
             if [[ "$use_include_filter" == true ]] && [[ ${#include_patterns[@]} -gt 0 ]]; then
@@ -556,14 +654,25 @@ main() {
             fi
         fi
         
-        # Apply exclude filter
+        # Apply exclude filter for patterns that couldn't be pruned
         if [[ "$use_exclude_filter" == true ]] && [[ ${#exclude_patterns[@]} -gt 0 ]]; then
-            if matches_pattern "$relative_path" "${exclude_patterns[@]}"; then
+            local should_exclude=false
+            for pattern in "${exclude_patterns[@]}"; do
+                # Skip directory patterns (already handled by -prune)
+                if [[ "$pattern" =~ /\*?$ ]]; then
+                    continue
+                fi
+                if matches_pattern "$relative_path" "$pattern"; then
+                    should_exclude=true
+                    break
+                fi
+            done
+            if [[ "$should_exclude" == true ]]; then
                 continue
             fi
         fi
         
-        # Apply include filter
+        # Apply include filter for complex patterns
         if [[ "$use_include_filter" == true ]] && [[ ${#include_patterns[@]} -gt 0 ]]; then
             if ! matches_pattern "$relative_path" "${include_patterns[@]}"; then
                 continue
@@ -574,7 +683,7 @@ main() {
         process_file "$file" "$relative_path"
         ((processed_count++)) || true  # Prevent exit on arithmetic operations
         
-    done < <("${find_cmd[@]}" -print0 2>/dev/null)
+    done < <("${find_cmd[@]}" 2>/dev/null)
     
     # Generate summary if requested
     if [[ "$include_summary" == true ]] && (( processed_count > 0 )); then
@@ -585,10 +694,6 @@ main() {
     if [[ "$output_mode" == "file" ]]; then
         success "Summary complete: $processed_count/$file_count files processed"
         success "Output saved to: $output_file"
-    else
-        if [[ "$include_summary" == false ]]; then
-            info "Processed $processed_count/$file_count files"
-        fi
     fi
 }
 
