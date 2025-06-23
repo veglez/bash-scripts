@@ -15,6 +15,7 @@ readonly SCRIPT_VERSION="2.0.0"
 # Default configuration
 readonly DEFAULT_OUTPUT_MODE="cli"
 readonly SUMMARY_FILENAME="folder_summary.txt"
+readonly DEFAULT_EXCLUDE_HIDDEN=true
 
 # Initialize variables
 folder_path=""
@@ -23,7 +24,7 @@ declare -a include_patterns=()
 declare -a exclude_patterns=()
 use_include_filter=false
 use_exclude_filter=false
-include_summary=false
+exclude_hidden="${DEFAULT_EXCLUDE_HIDDEN}"
 
 # Color codes for better CLI output (disabled if not interactive)
 if [[ -t 1 ]]; then
@@ -63,13 +64,14 @@ Options:
     -i, --include PATTERNS              Comma-separated list of patterns to include
     -e, --exclude PATTERNS              Comma-separated list of patterns to exclude
     -o, --output MODE                   Output mode: 'cli' (default) or 'file'
-    -is, --include-summary              Include summary of file contents (default: false)
+    -H, --include-hidden                Include hidden files and directories
     -v, --version                       Show version information
 
 Examples:
     ${SCRIPT_NAME} /path/to/folder
     ${SCRIPT_NAME} /path/to/folder --include '*.py,*.sh' --output file
     ${SCRIPT_NAME} /path/to/folder --exclude 'node_modules,*.log'
+    ${SCRIPT_NAME} /path/to/folder --include-hidden --exclude '.git/*'
 
 EOF
 }
@@ -90,6 +92,12 @@ PATTERN MATCHING:
     - Glob patterns: *.txt, test_*, file.??
     - Regex patterns: .*\\.py$, ^src/.*
     - Path patterns: src/*.js, **/test/*
+    
+    Hidden files behavior:
+    - Hidden files/directories are excluded by default
+    - Use --include-hidden to include ALL hidden files
+    - Use --include '.pattern' to include specific hidden files
+    - Exclude patterns work on hidden files when --include-hidden is used
 
 OPTIONS:
     <folder_path>
@@ -109,6 +117,11 @@ OPTIONS:
         - 'cli': Display on command line (default)
         - 'file': Save to '${SUMMARY_FILENAME}' in the target folder
 
+    -H, --include-hidden
+        Optional. Include hidden files and directories (those starting with .).
+        By default, hidden files are excluded unless explicitly matched by
+        an include pattern.
+
     -v, --version
         Display version information.
 
@@ -122,6 +135,15 @@ EXAMPLES:
     Include only Python and shell scripts:
         ${SCRIPT_NAME} /home/user/project --include '*.py,*.sh'
 
+    Include all files including hidden:
+        ${SCRIPT_NAME} /home/user/project --include-hidden
+        
+    Include specific hidden files without --include-hidden:
+        ${SCRIPT_NAME} /home/user/project --include '.bashrc,.gitignore'
+
+    Exclude .git but include other hidden files:
+        ${SCRIPT_NAME} /home/user/project --include-hidden --exclude '.git/*'
+
     Exclude test files and logs:
         ${SCRIPT_NAME} /home/user/project --exclude '*test*,*.log'
 
@@ -133,6 +155,9 @@ EXAMPLES:
 
 NOTES:
     - The script automatically excludes '${SUMMARY_FILENAME}' from processing
+    - Hidden files and directories (starting with .) are excluded by default
+    - Use --include-hidden to process all hidden files
+    - Use --include with specific patterns to include only certain hidden files
     - Patterns are matched against the relative path from the target folder
     - Use quotes around patterns to prevent shell expansion
     - File content is read using UTF-8 encoding
@@ -293,6 +318,10 @@ parse_arguments() {
                 help_message
                 exit 0
                 ;;
+            -H|--include-hidden)
+                exclude_hidden=false
+                shift
+                ;;
             -v|--version)
                 echo "${SCRIPT_NAME} v${SCRIPT_VERSION}"
                 exit 0
@@ -326,10 +355,6 @@ parse_arguments() {
                 fi
                 output_mode="$2"
                 shift 2
-                ;;
-            -is|--include-summary)
-                include_summary=true
-                shift
                 ;;
             -*)
                 error "Unknown option: $1"
@@ -389,10 +414,6 @@ main() {
     # Always exclude the summary file
     find_cmd+=(\! -name "$SUMMARY_FILENAME")
     
-    # Exclude hidden files and files inside hidden directories
-    find_cmd+=(\! -path '*/.*/*')
-    find_cmd+=(\! -path '*/.*')
-    
     # Process files
     local file_count=0
     local processed_count=0
@@ -402,6 +423,17 @@ main() {
         
         # Calculate relative path
         relative_path="${file#"$folder_path/"}"
+        
+        if [[ "$exclude_hidden" == true ]] && [[ "$relative_path" =~ (^|/)\. ]]; then
+            if [[ "$use_include_filter" == true ]] && [[ ${#include_patterns[@]} -gt 0 ]]; then
+                if ! matches_pattern "$relative_path" "${include_patterns[@]}"; then
+                    continue
+                fi
+                # If it matches an include pattern, process it despite being hidden
+            else
+                continue  # Skip hidden file
+            fi
+        fi
         
         # Apply exclude filter
         if [[ "$use_exclude_filter" == true ]] && [[ ${#exclude_patterns[@]} -gt 0 ]]; then
@@ -424,13 +456,11 @@ main() {
     done < <("${find_cmd[@]}" -print0 2>/dev/null)
     
     # Summary statistics
-    if $include_summary; then
-        if [[ "$output_mode" == "file" ]]; then
-            success "Summary complete: $processed_count/$file_count files processed"
-            success "Output saved to: $output_file"
-        else
-            info "Processed $processed_count/$file_count files"
-        fi
+    if [[ "$output_mode" == "file" ]]; then
+        success "Summary complete: $processed_count/$file_count files processed"
+        success "Output saved to: $output_file"
+    else
+        info "Processed $processed_count/$file_count files"
     fi
 }
 
