@@ -530,7 +530,7 @@ main() {
     validate_directory "$folder_path"
     
     # Resolve to absolute path
-    folder_path=$(cd "$folder_path" && pwd)
+#     folder_path=$(cd "$folder_path" && pwd)
     
     # Define output file path
     output_file="${folder_path}/${SUMMARY_FILENAME}"
@@ -638,7 +638,7 @@ main() {
         ((file_count++)) || true  # Prevent exit on arithmetic operations
         
         # Calculate relative path
-        relative_path="${file#"$folder_path/"}"
+        relative_path="${file}"
         
         # Check if we should exclude hidden files by default
         # (This is now mostly handled by find -prune, but we still check for edge cases)
